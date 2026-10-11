@@ -1,0 +1,6 @@
+streamlit
+pandas
+yfinance
+requests
+lxml
+streamlit-autorefresh
