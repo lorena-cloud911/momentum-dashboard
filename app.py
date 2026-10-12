@@ -1,7 +1,8 @@
 """
-Momentum-Dashboard - Schritt 3
-Universum (Indizes, Rohstoffe, Krypto-ETFs), Kurse, Momentum-Score, Signal, Haltedauer
-und Analystendaten (Konsens, Kursziel, Potenzial) fuer die staerksten Titel.
+Momentum-Dashboard - Schritt 4
+Universum (Indizes, Rohstoffe, Krypto-ETFs), Kurse, Momentum-Score, Signal, Haltedauer,
+Analystendaten und KI-Recherche (Gemini) fuer die Top 20.
+Der Gemini-Schluessel steht NICHT hier, sondern in den Streamlit-"Secrets" (GEMINI_API_KEY).
 Benoetigt zusaetzlich die Datei momentum.py im selben Ordner.
 
 Starten lokal:   streamlit run app.py
@@ -10,6 +11,7 @@ Aenderungen:     Einstellungen ganz oben (REFRESH_MIN, INDIZES, ROHSTOFFE, KRYPT
 
 import io
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -37,6 +39,9 @@ BACKTEST_TOP = 0.20  # der Backtest testet die oberen 20 %
 KOSTEN_PRO_RUNDE = 0.005  # 0,5 % je Kauf+Verkauf (Gebuehren + Spread), anpassbar
 MIN_GRUPPE = 30  # eine Gruppe braucht so viele Titel fuer einen eigenen Backtest
 ANALYSTEN_TOP_N = 150  # Analystendaten nur fuer die besten N Titel mit Signal Kaufen/Halten
+KI_TOP_N = 20  # so viele Titel mit Signal "Kaufen" recherchiert die KI
+GEMINI_MODEL = "gemini-3.5-flash"  # bei Fehlermeldung "model not found" hier den Namen anpassen
+KI_PAUSE_SEK = 5  # Pause zwischen KI-Abfragen (Gratis-Tarif erlaubt nur wenige pro Minute)
 
 # Jeder Index: Wikipedia-Seite (oder None), Boersen-Endung fuer Yahoo,
 # erwartete Anzahl (nur fuer die Statusanzeige) und optionale eigene CSV-Datei.
@@ -364,6 +369,74 @@ def load_analysts(tickers: tuple):
 
 
 # ----------------------------------------------------------------------------
+# KI-RECHERCHE (Gemini mit Google-Suche), einmal pro Tag und Titel
+# ----------------------------------------------------------------------------
+def gemini_key():
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return None
+
+
+def _ki_prompt(c, heute):
+    return f"""Du bist ein vorsichtiger Recherche-Assistent fuer Aktien. Heute ist der {heute}.
+Recherchiere im Web aktuelle Informationen zu: {c['Name']} (Ticker {c['Ticker']}).
+Diese Zahlen kommen aus meiner eigenen Berechnung, uebernimm sie unveraendert und rechne nicht neu:
+Momentum-Rang {c['Rang']}, Rendite 12-1 Monate {c['r121']}, Rendite 6 Monate {c['r6']},
+Analysten-Konsens {c['Konsens']}, Kursziel-Potenzial {c['Potenzial']}.
+
+Antworte auf Deutsch, GENAU in diesem Format:
+ZUSAMMENFASSUNG: 2 bis 3 Saetze. Warum laeuft der Kurs aktuell so stark? Nur Dinge nennen, die in den gefundenen Quellen stehen.
+RISIKEN: 1 bis 2 Saetze. Moegliche Risiken (z. B. anstehende Quartalszahlen, Rechtsstreit, hohe Bewertung, Branchenlage), nur belegt durch Quellen.
+
+Regeln: Keine Zahlen erfinden. Wenn du nichts Aktuelles findest, schreibe genau: Keine aktuellen Meldungen gefunden.
+Keine Kauf- oder Verkaufsempfehlung."""
+
+
+def _ki_parse(text):
+    text = (text or "").strip()
+    m = re.search(r"ZUSAMMENFASSUNG:\s*(.*?)\s*RISIKEN:\s*(.*)", text, flags=re.S | re.I)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return text, ""
+
+
+def _ki_quellen(resp):
+    out = []
+    try:
+        for ch in (resp.candidates[0].grounding_metadata.grounding_chunks or []):
+            if ch.web and ch.web.uri and ch.web.uri not in [u for _, u in out]:
+                out.append((ch.web.title or "Quelle", ch.web.uri))
+    except Exception:
+        pass
+    return out[:5]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def ki_recherche(ticker: str, tag: str, _ctx: dict):
+    """Fehler werden absichtlich als Exception nach aussen gegeben, damit sie NICHT zwischengespeichert werden."""
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=gemini_key())
+    prompt = _ki_prompt(_ctx, tag)
+    hinweis = ""
+    try:
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.2))
+    except Exception:
+        # Fallback: ohne Websuche (dann ohne Quellen, aus dem Modellwissen)
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2))
+        hinweis = "Ohne Websuche erstellt (Suche war nicht verfuegbar), daher unbelegt."
+    zus, risiken = _ki_parse(resp.text)
+    time.sleep(KI_PAUSE_SEK)  # laeuft nur bei echten Abfragen, nicht bei gespeicherten
+    return {"zusammenfassung": zus, "risiken": risiken, "quellen": _ki_quellen(resp), "hinweis": hinweis}
+
+
+# ----------------------------------------------------------------------------
 # SEITE
 # ----------------------------------------------------------------------------
 st.title("Momentum-Dashboard")
@@ -432,23 +505,28 @@ c2.metric("Mit Kurs / mit Score", f"{int(df['Kurs'].notna().sum())} / {n_valid}"
 c3.metric("Signal Kaufen", int((df["Signal"] == "Kaufen").sum()))
 c4.metric("Angezeigt", len(view))
 
-st.dataframe(
-    view[["Rang", "Ticker", "Name", "Indizes", "Kurs", "Aenderung %", "Score",
-          "12-1 %", "6M %", "Trend", "Signal", "Haltedauer",
-          "Konsens", "Analysten", "Kursziel", "Potenzial %"]],
-    width="stretch", hide_index=True, height=650,
-    column_config={
-        "Rang": st.column_config.NumberColumn(format="%d"),
-        "Kurs": st.column_config.NumberColumn(format="%.2f"),
-        "Aenderung %": st.column_config.NumberColumn(format="%+.2f %%"),
-        "Score": st.column_config.NumberColumn(format="%.2f"),
-        "12-1 %": st.column_config.NumberColumn(format="%+.1f %%"),
-        "6M %": st.column_config.NumberColumn(format="%+.1f %%"),
-        "Analysten": st.column_config.NumberColumn(format="%d"),
-        "Kursziel": st.column_config.NumberColumn(format="%.2f"),
-        "Potenzial %": st.column_config.NumberColumn(format="%+.1f %%"),
-    },
-)
+df["KI-Zusammenfassung"] = ""
+view = view.copy()
+view["KI-Zusammenfassung"] = ""
+
+TABELLEN_SPALTEN = ["Rang", "Ticker", "Name", "Indizes", "Kurs", "Aenderung %", "Score",
+                    "12-1 %", "6M %", "Trend", "Signal", "Haltedauer",
+                    "Konsens", "Analysten", "Kursziel", "Potenzial %", "KI-Zusammenfassung"]
+SPALTEN_FORMAT = {
+    "Rang": st.column_config.NumberColumn(format="%d"),
+    "Kurs": st.column_config.NumberColumn(format="%.2f"),
+    "Aenderung %": st.column_config.NumberColumn(format="%+.2f %%"),
+    "Score": st.column_config.NumberColumn(format="%.2f"),
+    "12-1 %": st.column_config.NumberColumn(format="%+.1f %%"),
+    "6M %": st.column_config.NumberColumn(format="%+.1f %%"),
+    "Analysten": st.column_config.NumberColumn(format="%d"),
+    "Kursziel": st.column_config.NumberColumn(format="%.2f"),
+    "Potenzial %": st.column_config.NumberColumn(format="%+.1f %%"),
+    "KI-Zusammenfassung": st.column_config.TextColumn(width="large"),
+}
+tabellen_platz = st.empty()  # hier wird die Tabelle spaeter mit den KI-Texten neu gezeichnet
+tabellen_platz.dataframe(view[TABELLEN_SPALTEN], width="stretch", hide_index=True,
+                         height=650, column_config=SPALTEN_FORMAT)
 
 with st.expander("Wie entstehen Score, Signal und Haltedauer?"):
     st.markdown(
@@ -493,3 +571,64 @@ with st.expander("Datenstatus der Listen (hier siehst du, was fehlt)"):
     st.dataframe(status, width="stretch", hide_index=True)
     st.caption("Fehlt ein Index (z. B. Nikkei 225), lege im Ordner 'listen' eine CSV mit den Spalten "
                "ticker,name an. Japanische Codes (z. B. 7203) bekommen automatisch '.T' dazu.")
+
+
+# ----------------------------------------------------------------------------
+# KI-RECHERCHE DER TOP 20 (laeuft zuletzt, damit die Tabelle oben sofort sichtbar ist)
+# ----------------------------------------------------------------------------
+st.header(f"KI-Recherche: Top {KI_TOP_N} (Signal Kaufen)")
+top = df[df["Signal"] == "Kaufen"].nsmallest(KI_TOP_N, "Rang")
+
+if not gemini_key():
+    st.info("Fuer die KI-Recherche fehlt noch der Gemini-Schluessel. "
+            "Trage ihn in Streamlit unter 'Manage app', 'Settings', 'Secrets' als "
+            'GEMINI_API_KEY = "dein-schluessel" ein (siehe Anleitung).')
+elif top.empty:
+    st.write("Aktuell gibt es kein Signal Kaufen.")
+else:
+    heute = datetime.now(ZEITZONE).strftime("%d.%m.%Y")
+    fortschritt = st.progress(0.0, text="KI recherchiert ... (beim ersten Mal einige Minuten)")
+    ergebnisse, fehler_in_folge = {}, 0
+    for n, (_, z) in enumerate(top.iterrows(), start=1):
+        ctx = {
+            "Ticker": z["Ticker"], "Name": z["Name"], "Rang": int(z["Rang"]),
+            "r121": f"{z['12-1 %']:+.0f} %" if pd.notna(z["12-1 %"]) else "unbekannt",
+            "r6": f"{z['6M %']:+.0f} %" if pd.notna(z["6M %"]) else "unbekannt",
+            "Konsens": z["Konsens"] if pd.notna(z["Konsens"]) else "unbekannt",
+            "Potenzial": f"{z['Potenzial %']:+.0f} %" if pd.notna(z["Potenzial %"]) else "unbekannt",
+        }
+        try:
+            ergebnisse[z["Ticker"]] = ki_recherche(z["Ticker"], heute, ctx)
+            fehler_in_folge = 0
+        except Exception as e:
+            ergebnisse[z["Ticker"]] = {"zusammenfassung": "", "risiken": "", "quellen": [],
+                                       "hinweis": f"Fehler: {str(e)[:150]}"}
+            fehler_in_folge += 1
+        fortschritt.progress(n / len(top), text=f"KI recherchiert ... {n} von {len(top)}")
+        if fehler_in_folge >= 3:
+            st.warning("Drei Fehler hintereinander (vermutlich Tageslimit oder falscher Schluessel). "
+                       "Ich breche ab und versuche es beim naechsten Laden wieder.")
+            break
+    fortschritt.empty()
+
+    # Tabelle oben mit KI-Zusammenfassung neu zeichnen
+    view["KI-Zusammenfassung"] = view["Ticker"].map(
+        lambda t: ergebnisse.get(t, {}).get("zusammenfassung", ""))
+    tabellen_platz.dataframe(view[TABELLEN_SPALTEN], width="stretch", hide_index=True,
+                             height=650, column_config=SPALTEN_FORMAT)
+
+    for _, z in top.iterrows():
+        r = ergebnisse.get(z["Ticker"])
+        if not r:
+            continue
+        with st.expander(f"#{int(z['Rang'])}  {z['Name']} ({z['Ticker']})  |  {z['Haltedauer']}"):
+            if r["hinweis"]:
+                st.caption(r["hinweis"])
+            if r["zusammenfassung"]:
+                st.markdown(f"**Zusammenfassung:** {r['zusammenfassung']}")
+            if r["risiken"]:
+                st.markdown(f"**Risiken:** {r['risiken']}")
+            if r["quellen"]:
+                st.markdown("**Quellen:** " + " | ".join(f"[{t}]({u})" for t, u in r["quellen"]))
+    st.caption("Die KI kann sich irren. Zahlen (Score, Kurs, Kursziel) stammen aus dem Skript, nicht von der KI. "
+               "Pruefe wichtige Aussagen ueber die Quellen-Links. Keine Anlageberatung.")

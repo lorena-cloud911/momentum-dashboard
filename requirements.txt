@@ -4,3 +4,4 @@ yfinance
 requests
 lxml
 streamlit-autorefresh
+google-genai
