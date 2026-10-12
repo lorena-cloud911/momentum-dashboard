@@ -1,6 +1,7 @@
 """
-Momentum-Dashboard - Schritt 2
-Universum (Indizes, Rohstoffe, Krypto-ETFs), Kurse, Momentum-Score, Signal und Haltedauer.
+Momentum-Dashboard - Schritt 3
+Universum (Indizes, Rohstoffe, Krypto-ETFs), Kurse, Momentum-Score, Signal, Haltedauer
+und Analystendaten (Konsens, Kursziel, Potenzial) fuer die staerksten Titel.
 Benoetigt zusaetzlich die Datei momentum.py im selben Ordner.
 
 Starten lokal:   streamlit run app.py
@@ -10,6 +11,7 @@ Aenderungen:     Einstellungen ganz oben (REFRESH_MIN, INDIZES, ROHSTOFFE, KRYPT
 import io
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -34,6 +36,7 @@ HALTEN_TOP = 0.30   # obere 30 % = Halten, alles darunter = Verkaufen
 BACKTEST_TOP = 0.20  # der Backtest testet die oberen 20 %
 KOSTEN_PRO_RUNDE = 0.005  # 0,5 % je Kauf+Verkauf (Gebuehren + Spread), anpassbar
 MIN_GRUPPE = 30  # eine Gruppe braucht so viele Titel fuer einen eigenen Backtest
+ANALYSTEN_TOP_N = 150  # Analystendaten nur fuer die besten N Titel mit Signal Kaufen/Halten
 
 # Jeder Index: Wikipedia-Seite (oder None), Boersen-Endung fuer Yahoo,
 # erwartete Anzahl (nur fuer die Statusanzeige) und optionale eigene CSV-Datei.
@@ -326,6 +329,41 @@ def signal(rang, n_valid, trend):
 
 
 # ----------------------------------------------------------------------------
+# ANALYSTENDATEN (nur fuer die staerksten Titel, damit Yahoo nicht blockiert)
+# ----------------------------------------------------------------------------
+KONSENS_DE = {
+    "strong_buy": "Stark kaufen", "buy": "Kaufen", "hold": "Halten",
+    "underperform": "Untergewichten", "sell": "Verkaufen",
+}
+
+
+def _analyst_one(ticker):
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return ticker, {}
+    kurs = info.get("currentPrice") or info.get("regularMarketPrice")
+    ziel = info.get("targetMeanPrice")
+    pot = (ziel / kurs - 1) * 100 if kurs and ziel else None
+    return ticker, {
+        "Konsens": KONSENS_DE.get(info.get("recommendationKey"), None),
+        "Analysten": info.get("numberOfAnalystOpinions"),
+        "Kursziel": ziel,
+        "Potenzial %": pot,
+    }
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner="Analystendaten werden geladen ...")
+def load_analysts(tickers: tuple):
+    if not tickers:
+        return pd.DataFrame(columns=["Konsens", "Analysten", "Kursziel", "Potenzial %"])
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(_analyst_one, tickers))
+    return pd.DataFrame({t: d for t, d in results}).T.reindex(
+        columns=["Konsens", "Analysten", "Kursziel", "Potenzial %"])
+
+
+# ----------------------------------------------------------------------------
 # SEITE
 # ----------------------------------------------------------------------------
 st.title("Momentum-Dashboard")
@@ -357,6 +395,12 @@ df["Haltedauer"] = [
     (f"ca. {best_je_gruppe.get(g)} Monate" if s in ("Kaufen", "Halten") and best_je_gruppe.get(g) else "-")
     for g, s in zip(df["Gruppe"], df["Signal"])
 ]
+
+top_ticker = df[df["Signal"].isin(["Kaufen", "Halten"])].nsmallest(ANALYSTEN_TOP_N, "Rang")["Ticker"]
+analysten = load_analysts(tuple(sorted(top_ticker)))
+df = df.merge(analysten, left_on="Ticker", right_index=True, how="left")
+for spalte in ("Analysten", "Kursziel", "Potenzial %"):
+    df[spalte] = pd.to_numeric(df[spalte], errors="coerce")
 
 st.caption(
     f"Stand der Kurse: {stand} (Zeitzone Zuerich). Kurse alle {REFRESH_MIN} Minuten neu, "
@@ -390,7 +434,8 @@ c4.metric("Angezeigt", len(view))
 
 st.dataframe(
     view[["Rang", "Ticker", "Name", "Indizes", "Kurs", "Aenderung %", "Score",
-          "12-1 %", "6M %", "Trend", "Signal", "Haltedauer"]],
+          "12-1 %", "6M %", "Trend", "Signal", "Haltedauer",
+          "Konsens", "Analysten", "Kursziel", "Potenzial %"]],
     width="stretch", hide_index=True, height=650,
     column_config={
         "Rang": st.column_config.NumberColumn(format="%d"),
@@ -399,6 +444,9 @@ st.dataframe(
         "Score": st.column_config.NumberColumn(format="%.2f"),
         "12-1 %": st.column_config.NumberColumn(format="%+.1f %%"),
         "6M %": st.column_config.NumberColumn(format="%+.1f %%"),
+        "Analysten": st.column_config.NumberColumn(format="%d"),
+        "Kursziel": st.column_config.NumberColumn(format="%.2f"),
+        "Potenzial %": st.column_config.NumberColumn(format="%+.1f %%"),
     },
 )
 
@@ -414,6 +462,11 @@ und Trend ok. Alles andere = Verkaufen (das ist auch die Ausstiegsregel). n/a = 
 **Haltedauer:** Ergebnis eines Backtests ueber die letzten 5 Jahre: Welche Haltedauer ({", ".join(map(str, HOLD_MONTHS))} Monate)
 brachte bei den staerksten {BACKTEST_TOP:.0%} nach Kosten ({KOSTEN_PRO_RUNDE:.1%} je Kauf+Verkauf) die beste Rendite je Monat?
 Das ist eine Schaetzung je Gruppe (Index), keine Vorhersage fuer die einzelne Aktie.
+
+**Analystendaten:** Konsens, Anzahl der Analysten, durchschnittliches Kursziel und das Potenzial dazu in %
+(Kursziel gegen aktuellen Kurs). Sie werden nur fuer die {ANALYSTEN_TOP_N} staerksten Titel mit Signal Kaufen/Halten geladen,
+weil Yahoo bei zu vielen Abfragen blockiert. Leer heisst: keine Daten verfuegbar (haeufig bei Nikkei, kleinen Werten, Rohstoffen).
+Analysten sind oft zu optimistisch und hinken den Kursen hinterher - nutze das als Zusatzinfo, nicht als Hauptkriterium.
 
 **Grenzen:** Der Backtest nutzt nur die heutigen Index-Mitglieder (zu optimistisch, "Survivorship Bias"),
 5 Jahre sind kurz, die Zeitraeume ueberlappen, Steuern und Waehrungseffekte fehlen. Analysewerkzeug, keine Anlageberatung.
